@@ -3,11 +3,11 @@ HR Policy Assistant
 -------------------
 A beginner-friendly RAG application using:
 
-- Streamlit          -> Web interface
-- PyMuPDF            -> PDF text extraction
-- SentenceTransformers -> Text embeddings
-- FAISS              -> Vector similarity search
-- Groq               -> LLM answer generation
+- Streamlit              -> Web interface
+- PyMuPDF                -> PDF text extraction
+- SentenceTransformers   -> Text embeddings
+- FAISS                   -> Vector similarity search
+- Gemini                  -> LLM answer generation
 
 RAG pipeline:
 
@@ -29,22 +29,21 @@ Similarity search
  ↓
 Relevant chunks
  ↓
-Groq LLM
+Gemini LLM
  ↓
 Answer
 """
 
 import os
-import io
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
-import fitz  # PyMuPDF
+import fitz
 import faiss
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
-from groq import Groq
+from google import genai
 
 
 # ---------------------------------------------------------
@@ -53,13 +52,19 @@ from groq import Groq
 
 load_dotenv()
 
+# Sentence Transformer model used for creating embeddings.
 MODEL_NAME = "all-MiniLM-L6-v2"
-GROQ_MODEL = "openai/gpt-oss-20b"
 
+# Gemini model used for generating the final answer.
+GEMINI_MODEL = "gemini-2.5-flash"
+
+# Default RAG settings.
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_TOP_K = 5
 
+# Message shown when the answer cannot be found
+# in the retrieved HR policy context.
 FALLBACK_MESSAGE = (
     "The information could not be found in the uploaded HR policy."
 )
@@ -375,12 +380,12 @@ Content:
 
 
 # ---------------------------------------------------------
-# Get Groq client
+# Get Gemini client
 # ---------------------------------------------------------
 
-def get_groq_client() -> Groq:
+def get_gemini_client():
     """
-    Create a Groq client using GROQ_API_KEY.
+    Create a Gemini client using GEMINI_API_KEY.
 
     The key can come from:
     1. Streamlit secrets
@@ -391,25 +396,27 @@ def get_groq_client() -> Groq:
 
     # First try Streamlit secrets.
     try:
-        api_key = st.secrets.get("GROQ_API_KEY")
+        api_key = st.secrets.get("GEMINI_API_KEY")
     except Exception:
         pass
 
     # Then try environment variable.
     if not api_key:
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("GEMINI_API_KEY")
 
+    # Stop with a helpful message if no key is available.
     if not api_key:
         raise ValueError(
-            "Groq API key is missing. Add GROQ_API_KEY to your .env "
-            "file or Streamlit secrets."
+            "Gemini API key is missing. Add GEMINI_API_KEY "
+            "to your .env file or Streamlit secrets."
         )
 
-    return Groq(api_key=api_key)
+    # Create and return the Gemini client.
+    return genai.Client(api_key=api_key)
 
 
 # ---------------------------------------------------------
-# Generate answer using Groq
+# Generate answer using Gemini
 # ---------------------------------------------------------
 
 def generate_answer(
@@ -417,19 +424,23 @@ def generate_answer(
     retrieved_chunks: List[Dict],
 ) -> str:
     """
-    Send retrieved HR policy context and the question to Groq.
+    Send retrieved HR policy context and the question to Gemini.
 
     The model is explicitly instructed to answer ONLY from
     the retrieved policy context.
     """
 
+    # If FAISS did not find anything, don't call Gemini.
     if not retrieved_chunks:
         return FALLBACK_MESSAGE
 
-    client = get_groq_client()
+    # Create the Gemini client.
+    client = get_gemini_client()
 
+    # Convert retrieved chunks into context for Gemini.
     context = build_context(retrieved_chunks)
 
+    # System instruction that controls Gemini's behavior.
     system_prompt = f"""
 You are an HR Policy Assistant.
 
@@ -460,25 +471,24 @@ HR POLICY CONTEXT:
 """
 
     try:
-        completion = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": question,
-                },
-            ],
-            temperature=0,
-            max_completion_tokens=1024,
-            include_reasoning=False,
+        # Send the question and HR policy context to Gemini.
+        #
+        # Gemini's current Python SDK uses
+        # client.models.generate_content().
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=question,
+            config={
+                "system_instruction": system_prompt,
+                "temperature": 0,
+                "max_output_tokens": 1024,
+            },
         )
 
-        answer = completion.choices[0].message.content
+        # Get the generated text from Gemini.
+        answer = response.text
 
+        # If Gemini returned no text, use our fallback message.
         if not answer:
             return FALLBACK_MESSAGE
 
@@ -486,8 +496,8 @@ HR POLICY CONTEXT:
 
     except Exception as exc:
         raise RuntimeError(
-            "The Groq API could not generate an answer. "
-            "Please check your API key and internet connection."
+            "The Gemini API could not generate an answer. "
+            "Please check your Gemini API key and internet connection."
         ) from exc
 
 
@@ -610,7 +620,7 @@ with st.sidebar:
         ↓  
         **6.** Retrieve relevant chunks  
         ↓  
-        **7.** Ask Groq LLM  
+        **7.** Ask Gemini LLM  
         ↓  
         **8.** Generate answer
         """
