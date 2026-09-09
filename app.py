@@ -37,7 +37,7 @@ Answer
 import os
 from typing import List, Dict
 
-import fitz
+import pymupdf
 import faiss
 import numpy as np
 import streamlit as st
