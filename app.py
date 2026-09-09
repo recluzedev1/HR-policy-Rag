@@ -1,755 +1,799 @@
-import hashlib
-import os
-from typing import Any
+"""
+HR Policy Assistant
+-------------------
+A beginner-friendly RAG application using:
 
+- Streamlit          -> Web interface
+- PyMuPDF            -> PDF text extraction
+- SentenceTransformers -> Text embeddings
+- FAISS              -> Vector similarity search
+- Groq               -> LLM answer generation
+
+RAG pipeline:
+
+PDF
+ ↓
+Text extraction
+ ↓
+Text chunks
+ ↓
+Embeddings
+ ↓
+FAISS index
+ ↓
+User question
+ ↓
+Question embedding
+ ↓
+Similarity search
+ ↓
+Relevant chunks
+ ↓
+Groq LLM
+ ↓
+Answer
+"""
+
+import os
+import io
+from typing import List, Dict, Tuple
+
+import fitz  # PyMuPDF
 import faiss
-import fitz
 import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from sentence_transformers import SentenceTransformer
+from groq import Groq
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 load_dotenv()
 
-APP_TITLE = "HR Policy Assistant"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-GEMINI_MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "all-MiniLM-L6-v2"
+GROQ_MODEL = "openai/gpt-oss-20b"
 
-FALLBACK_ANSWER = "The information could not be found in the uploaded HR policy."
-
-DEFAULT_CHUNK_SIZE = 700
-DEFAULT_CHUNK_OVERLAP = 120
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_TOP_K = 5
-DEFAULT_SIMILARITY_THRESHOLD = 0.30
 
-MIN_CHUNK_SIZE = 100
-MAX_CHUNK_SIZE = 2000
-MIN_CHUNK_OVERLAP = 0
-MAX_CHUNK_OVERLAP = 500
-MIN_TOP_K = 1
-MAX_TOP_K = 10
+FALLBACK_MESSAGE = (
+    "The information could not be found in the uploaded HR policy."
+)
 
 
-# ---------------------------------------------------------------------------
-# Page configuration
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Streamlit page configuration
+# ---------------------------------------------------------
 
 st.set_page_config(
-    page_title=APP_TITLE,
-    page_icon="📘",
+    page_title="HR Policy Assistant",
+    page_icon="📚",
     layout="wide",
 )
 
 
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Custom CSS
+# ---------------------------------------------------------
 
-def initialize_session_state() -> None:
-    """Initialize values stored for the current Streamlit session."""
-    defaults = {
-        "messages": [],
-        "document_hash": None,
-        "document_name": None,
-        "document_info": None,
-        "chunks": None,
-        "index": None,
-        "indexed_chunk_count": 0,
-        "scanned_pages": [],
-    }
+st.markdown(
+    """
+    <style>
+        .main-title {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #1f4e79;
+            margin-bottom: 0.2rem;
+        }
 
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+        .subtitle {
+            color: #666666;
+            font-size: 1.05rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .source-box {
+            background-color: #f7f9fc;
+            border-left: 4px solid #1f77b4;
+            padding: 10px 15px;
+            margin: 8px 0;
+            border-radius: 5px;
+        }
+
+        .success-box {
+            background-color: #eef8f0;
+            border-left: 4px solid #2e8b57;
+            padding: 10px 15px;
+            border-radius: 5px;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-initialize_session_state()
+# ---------------------------------------------------------
+# Cached embedding model
+# ---------------------------------------------------------
+
+@st.cache_resource
+def load_embedding_model() -> SentenceTransformer:
+    """
+    Load the Sentence Transformer model once.
+
+    Streamlit caches this resource so we don't download/load
+    the model again for every question.
+    """
+    return SentenceTransformer(MODEL_NAME)
 
 
-# ---------------------------------------------------------------------------
-# PDF extraction
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# PDF text extraction
+# ---------------------------------------------------------
 
-def extract_pdf_pages(pdf_bytes: bytes) -> tuple[list[dict[str, Any]], list[int]]:
+def extract_text_from_pdf(pdf_bytes: bytes) -> List[Dict]:
     """
     Extract text from every page of a PDF.
 
     Returns:
-        pages:
-            One dictionary per PDF page containing:
-            - page: 1-based page number
-            - text: extracted text
-        scanned_pages:
-            Page numbers where no extractable text was found.
+        A list of dictionaries containing:
+        - page number
+        - page text
 
-    Raises:
-        ValueError:
-            If the PDF is empty, invalid, or contains no extractable text.
+    Page numbers are 1-based for user-friendly display.
     """
-    if not pdf_bytes:
-        raise ValueError("The uploaded PDF is empty.")
+
+    pages = []
 
     try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except fitz.FileDataError as exc:
-        raise ValueError(
-            "The uploaded file is not a valid PDF or the PDF is corrupted."
-        ) from exc
+        pdf_document = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf"
+        )
+
+        if pdf_document.page_count == 0:
+            pdf_document.close()
+            raise ValueError("The PDF contains no pages.")
+
+        for page_number in range(pdf_document.page_count):
+            page = pdf_document.load_page(page_number)
+
+            text = page.get_text("text").strip()
+
+            if text:
+                pages.append(
+                    {
+                        "page": page_number + 1,
+                        "text": text,
+                    }
+                )
+
+        pdf_document.close()
+
     except Exception as exc:
-        raise ValueError(f"Could not open the PDF: {exc}") from exc
-
-    if document.page_count == 0:
-        document.close()
-        raise ValueError("The PDF contains no pages.")
-
-    pages: list[dict[str, Any]] = []
-    scanned_pages: list[int] = []
-
-    try:
-        for page_index in range(document.page_count):
-            page_number = page_index + 1
-            page = document.load_page(page_index)
-
-            try:
-                text = page.get_text("text")
-            except Exception:
-                text = ""
-
-            text = " ".join(text.split())
-
-            pages.append(
-                {
-                    "page": page_number,
-                    "text": text,
-                }
-            )
-
-            if not text:
-                scanned_pages.append(page_number)
-    finally:
-        document.close()
-
-    extractable_text = [page["text"] for page in pages if page["text"]]
-
-    if not extractable_text:
         raise ValueError(
-            "No extractable text was found in the PDF. "
-            "The document may be scanned/image-only. "
-            "This app does not perform OCR, so please upload a text-based PDF."
-        )
+            f"Could not read the PDF. Please make sure it is a valid PDF file."
+        ) from exc
 
-    return pages, scanned_pages
+    return pages
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Text chunking
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 
-def validate_chunk_settings(
-    chunk_size: int,
-    chunk_overlap: int,
-) -> tuple[int, int]:
-    """Validate chunk-size and overlap settings."""
-    if not MIN_CHUNK_SIZE <= chunk_size <= MAX_CHUNK_SIZE:
-        raise ValueError(
-            f"Chunk size must be between {MIN_CHUNK_SIZE} and "
-            f"{MAX_CHUNK_SIZE} words."
-        )
+def chunk_text(
+    pages: List[Dict],
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
+) -> List[Dict]:
+    """
+    Split extracted PDF text into overlapping chunks.
 
-    if not MIN_CHUNK_OVERLAP <= chunk_overlap <= MAX_CHUNK_OVERLAP:
-        raise ValueError(
-            f"Chunk overlap must be between {MIN_CHUNK_OVERLAP} and "
-            f"{MAX_CHUNK_OVERLAP} words."
-        )
+    Each chunk keeps its page number so that we can show
+    the user where the information came from.
+
+    This is a simple character-based chunking strategy,
+    which is easy for beginners to understand.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError("Chunk size must be greater than zero.")
+
+    if chunk_overlap < 0:
+        raise ValueError("Chunk overlap cannot be negative.")
 
     if chunk_overlap >= chunk_size:
-        raise ValueError("Chunk overlap must be smaller than chunk size.")
+        raise ValueError(
+            "Chunk overlap must be smaller than chunk size."
+        )
 
-    return chunk_size, chunk_overlap
-
-
-def chunk_pages(
-    pages: list[dict[str, Any]],
-    chunk_size: int,
-    chunk_overlap: int,
-) -> list[dict[str, Any]]:
-    """
-    Split each page into overlapping word-based chunks.
-
-    Chunking is performed independently per page so every chunk keeps
-    an unambiguous original PDF page number.
-    """
-    chunk_size, chunk_overlap = validate_chunk_settings(
-        chunk_size,
-        chunk_overlap,
-    )
-
-    chunks: list[dict[str, Any]] = []
-    chunk_id = 0
-
-    step = chunk_size - chunk_overlap
+    chunks = []
 
     for page_data in pages:
         page_number = page_data["page"]
-        text = page_data["text"].strip()
-
-        if not text:
-            continue
-
-        words = text.split()
-
-        if len(words) <= chunk_size:
-            chunks.append(
-                {
-                    "chunk_id": chunk_id,
-                    "page": page_number,
-                    "text": text,
-                }
-            )
-            chunk_id += 1
-            continue
+        text = page_data["text"]
 
         start = 0
 
-        while start < len(words):
-            end = min(start + chunk_size, len(words))
-            chunk_text = " ".join(words[start:end]).strip()
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
 
-            if chunk_text:
+            chunk = text[start:end].strip()
+
+            if chunk:
                 chunks.append(
                     {
-                        "chunk_id": chunk_id,
+                        "text": chunk,
                         "page": page_number,
-                        "text": chunk_text,
                     }
                 )
-                chunk_id += 1
 
-            if end >= len(words):
+            if end >= len(text):
                 break
 
-            start += step
+            start = end - chunk_overlap
 
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# Embedding model
-# ---------------------------------------------------------------------------
-
-@st.cache_resource(show_spinner="Loading the embedding model...")
-def get_embedding_model() -> SentenceTransformer:
-    """
-    Load and cache the Sentence Transformer model.
-
-    Streamlit keeps this model in its resource cache so it does not need
-    to be downloaded/reloaded on every app rerun.
-    """
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
+# ---------------------------------------------------------
+# Create embeddings
+# ---------------------------------------------------------
 
 def create_embeddings(
-    texts: list[str],
+    texts: List[str],
     model: SentenceTransformer,
 ) -> np.ndarray:
     """
-    Create normalized float32 embeddings.
+    Convert text chunks into numerical vectors.
 
-    Normalization makes inner-product similarity equivalent to cosine
-    similarity for FAISS IndexFlatIP.
+    normalize_embeddings=True makes cosine similarity
+    equivalent to inner-product similarity when using
+    FAISS IndexFlatIP.
     """
+
     if not texts:
-        return np.empty((0, 384), dtype=np.float32)
+        raise ValueError("There is no text to embed.")
 
     embeddings = model.encode(
         texts,
-        batch_size=32,
-        show_progress_bar=False,
-        normalize_embeddings=True,
         convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
     )
 
-    return np.asarray(embeddings, dtype=np.float32)
+    return embeddings.astype("float32")
 
 
-# ---------------------------------------------------------------------------
-# FAISS indexing
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Build FAISS index
+# ---------------------------------------------------------
 
 def build_faiss_index(
-    chunks: list[dict[str, Any]],
-    model: SentenceTransformer,
-) -> faiss.IndexFlatIP:
+    embeddings: np.ndarray,
+) -> faiss.Index:
     """
-    Build an in-memory FAISS inner-product index from normalized embeddings.
+    Create a FAISS similarity-search index.
+
+    IndexFlatIP performs inner-product similarity.
+    Because our embeddings are normalized, this behaves
+    like cosine similarity.
     """
-    if not chunks:
-        raise ValueError("No text chunks are available to index.")
 
-    texts = [chunk["text"] for chunk in chunks]
-    embeddings = create_embeddings(texts, model)
-
-    if embeddings.shape[0] == 0:
-        raise ValueError("Could not create embeddings for the policy text.")
+    if embeddings.ndim != 2:
+        raise ValueError("Embeddings must be a 2D array.")
 
     dimension = embeddings.shape[1]
+
     index = faiss.IndexFlatIP(dimension)
+
     index.add(embeddings)
 
     return index
 
 
-# ---------------------------------------------------------------------------
-# Cached document processing
-# ---------------------------------------------------------------------------
-
-@st.cache_resource(
-    show_spinner="Extracting the PDF, creating chunks, and building FAISS index..."
-)
-def process_document(
-    pdf_bytes: bytes,
-    chunk_size: int,
-    chunk_overlap: int,
-) -> tuple[list[dict[str, Any]], faiss.IndexFlatIP, list[int]]:
-    """
-    Extract, chunk, embed, and index a PDF.
-
-    The PDF bytes and chunk settings form the cache key, so the same
-    document/settings combination reuses its FAISS index.
-    """
-    pages, scanned_pages = extract_pdf_pages(pdf_bytes)
-    chunks = chunk_pages(
-        pages,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-    )
-
-    if not chunks:
-        raise ValueError("No usable text chunks could be created from the PDF.")
-
-    model = get_embedding_model()
-    index = build_faiss_index(chunks, model)
-
-    return chunks, index, scanned_pages
-
-
-# ---------------------------------------------------------------------------
-# Retrieval
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Retrieve relevant chunks
+# ---------------------------------------------------------
 
 def retrieve_relevant_chunks(
     question: str,
-    index: faiss.IndexFlatIP,
-    chunks: list[dict[str, Any]],
     model: SentenceTransformer,
-    top_k: int,
-    similarity_threshold: float,
-) -> list[dict[str, Any]]:
+    index: faiss.Index,
+    chunks: List[Dict],
+    top_k: int = DEFAULT_TOP_K,
+) -> List[Dict]:
     """
-    Embed a user question and retrieve the most similar policy chunks.
+    Embed the user's question and search the FAISS index.
 
-    Results below the configured similarity threshold are discarded.
+    Returns the top matching chunks with similarity scores.
     """
+
     if not question.strip():
         return []
 
     if index.ntotal == 0:
         return []
 
-    top_k = min(max(1, top_k), index.ntotal)
+    question_embedding = model.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    ).astype("float32")
 
-    question_embedding = create_embeddings(
-        [question.strip()],
-        model,
+    number_to_retrieve = min(top_k, index.ntotal)
+
+    scores, indices = index.search(
+        question_embedding,
+        number_to_retrieve,
     )
 
-    scores, indices = index.search(question_embedding, top_k)
+    results = []
 
-    retrieved: list[dict[str, Any]] = []
-
-    for score, chunk_index in zip(scores[0], indices[0]):
-        if chunk_index < 0:
+    for score, index_position in zip(scores[0], indices[0]):
+        if index_position < 0:
             continue
 
-        similarity = float(score)
+        chunk = chunks[index_position].copy()
+        chunk["score"] = float(score)
 
-        if similarity < similarity_threshold:
-            continue
+        results.append(chunk)
 
-        chunk = chunks[int(chunk_index)].copy()
-        chunk["similarity"] = similarity
-        retrieved.append(chunk)
-
-    return retrieved
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Gemini
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Build context for LLM
+# ---------------------------------------------------------
 
-@st.cache_resource
-def get_gemini_client(api_key: str) -> genai.Client:
-    """Create and cache a Gemini API client for the supplied API key."""
-    return genai.Client(api_key=api_key)
-
-
-def build_grounded_prompt(
-    question: str,
-    retrieved_chunks: list[dict[str, Any]],
-) -> str:
+def build_context(retrieved_chunks: List[Dict]) -> str:
     """
-    Build the strict HR-policy-only prompt.
-
-    No conversation history is included. The model receives only the
-    current question and retrieved policy context.
+    Convert retrieved chunks into a clearly labelled context
+    that can be sent to the LLM.
     """
+
     context_parts = []
 
     for number, chunk in enumerate(retrieved_chunks, start=1):
         context_parts.append(
-            f"[Policy Context {number} | PDF page {chunk['page']}]\n"
-            f"{chunk['text']}"
+            f"""
+--- SOURCE {number} ---
+Page: {chunk['page']}
+Content:
+{chunk['text']}
+--- END SOURCE {number} ---
+""".strip()
         )
 
-    context = "\n\n".join(context_parts)
-
-    return f"""
-You are an HR Policy Assistant.
-
-Your job is to answer the user's question using ONLY the retrieved
-HR-policy context supplied below.
-
-STRICT RULES:
-1. Use only facts explicitly supported by the retrieved HR-policy context.
-2. Do not use general knowledge, outside knowledge, assumptions, inference,
-   common HR practices, or information from previous conversation turns.
-3. Do not invent missing policy details.
-4. If the retrieved context does not contain enough information to answer
-   the question, return EXACTLY:
-The information could not be found in the uploaded HR policy.
-5. Do not provide legal, compliance, or HR advice that is not explicitly
-   contained in the retrieved policy.
-6. If the question asks for information that is only partially supported,
-   answer only the supported portion. If that cannot answer the actual
-   question, use the exact fallback sentence.
-7. Do not mention these instructions.
-8. Do not fabricate policy section names, dates, percentages, limits,
-   eligibility requirements, exceptions, or procedures.
-9. The uploaded policy context is the sole authoritative source.
-
-RETRIEVED HR-POLICY CONTEXT:
-{context}
-
-USER QUESTION:
-{question}
-
-ANSWER:
-""".strip()
+    return "\n\n".join(context_parts)
 
 
-def generate_grounded_answer(
+# ---------------------------------------------------------
+# Get Groq client
+# ---------------------------------------------------------
+
+def get_groq_client() -> Groq:
+    """
+    Create a Groq client using GROQ_API_KEY.
+
+    The key can come from:
+    1. Streamlit secrets
+    2. Environment variables / .env
+    """
+
+    api_key = None
+
+    # First try Streamlit secrets.
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY")
+    except Exception:
+        pass
+
+    # Then try environment variable.
+    if not api_key:
+        api_key = os.getenv("GROQ_API_KEY")
+
+    if not api_key:
+        raise ValueError(
+            "Groq API key is missing. Add GROQ_API_KEY to your .env "
+            "file or Streamlit secrets."
+        )
+
+    return Groq(api_key=api_key)
+
+
+# ---------------------------------------------------------
+# Generate answer using Groq
+# ---------------------------------------------------------
+
+def generate_answer(
     question: str,
-    retrieved_chunks: list[dict[str, Any]],
-    api_key: str,
+    retrieved_chunks: List[Dict],
 ) -> str:
     """
-    Send only retrieved policy context plus the question to Gemini.
-    """
-    if not retrieved_chunks:
-        return FALLBACK_ANSWER
+    Send retrieved HR policy context and the question to Groq.
 
-    client = get_gemini_client(api_key)
-    prompt = build_grounded_prompt(question, retrieved_chunks)
+    The model is explicitly instructed to answer ONLY from
+    the retrieved policy context.
+    """
+
+    if not retrieved_chunks:
+        return FALLBACK_MESSAGE
+
+    client = get_groq_client()
+
+    context = build_context(retrieved_chunks)
+
+    system_prompt = f"""
+You are an HR Policy Assistant.
+
+Your job is to answer questions ONLY using the HR policy
+context provided below.
+
+STRICT RULES:
+
+1. Use only information contained in the provided context.
+2. Do not use your general knowledge.
+3. Do not guess.
+4. Do not invent policy rules, numbers, dates, benefits,
+   requirements, or exceptions.
+5. If the answer cannot be determined from the provided
+   context, respond exactly with:
+
+"The information could not be found in the uploaded HR policy."
+
+6. Keep the answer clear, concise, and beginner-friendly.
+7. When useful, mention the relevant policy page number.
+8. If multiple policy sections are relevant, combine them
+   carefully without adding information that isn't present.
+9. Treat the uploaded policy as the source of truth.
+
+HR POLICY CONTEXT:
+
+{context}
+"""
 
     try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                candidate_count=1,
-                max_output_tokens=1000,
-            ),
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {
+                    "role": "user",
+                    "content": question,
+                },
+            ],
+            temperature=0,
+            max_completion_tokens=1024,
+            include_reasoning=False,
         )
 
-        answer = (response.text or "").strip()
+        answer = completion.choices[0].message.content
 
         if not answer:
-            return FALLBACK_ANSWER
+            return FALLBACK_MESSAGE
 
-        return answer
+        return answer.strip()
 
     except Exception as exc:
-        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+        raise RuntimeError(
+            "The Groq API could not generate an answer. "
+            "Please check your API key and internet connection."
+        ) from exc
 
 
-# ---------------------------------------------------------------------------
-# Source display
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Display sources
+# ---------------------------------------------------------
 
-def display_sources(sources: list[dict[str, Any]]) -> None:
-    """Display retrieved policy sources and their PDF page numbers."""
-    if not sources:
+def display_sources(retrieved_chunks: List[Dict]) -> None:
+    """
+    Display the pages/chunks retrieved by FAISS.
+    """
+
+    if not retrieved_chunks:
         return
 
-    with st.expander("📚 Sources / retrieved policy pages"):
-        for source_number, source in enumerate(sources, start=1):
-            similarity = source.get("similarity", 0.0)
+    st.markdown("### 📌 Sources")
 
-            st.markdown(
-                f"**Source {source_number} — PDF page {source['page']}**  \n"
-                f"Similarity: `{similarity:.3f}`"
-            )
+    for number, chunk in enumerate(retrieved_chunks, start=1):
+        score = chunk.get("score", 0)
 
-            st.caption(source["text"])
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-def get_file_hash(file_bytes: bytes) -> str:
-    """Create a stable SHA-256 identifier for uploaded document bytes."""
-    return hashlib.sha256(file_bytes).hexdigest()
+        with st.expander(
+            f"Source {number} — Page {chunk['page']} "
+            f"(similarity: {score:.3f})"
+        ):
+            st.write(chunk["text"])
 
 
-def clear_chat() -> None:
-    """Clear conversation history while keeping the indexed PDF."""
+# ---------------------------------------------------------
+# Initialize session state
+# ---------------------------------------------------------
+
+if "messages" not in st.session_state:
     st.session_state.messages = []
 
-
-def reset_document_state() -> None:
-    """Clear document-specific state."""
-    st.session_state.document_hash = None
+if "document_name" not in st.session_state:
     st.session_state.document_name = None
-    st.session_state.document_info = None
+
+if "pages" not in st.session_state:
+    st.session_state.pages = None
+
+if "chunks" not in st.session_state:
     st.session_state.chunks = None
+
+if "index" not in st.session_state:
     st.session_state.index = None
-    st.session_state.indexed_chunk_count = 0
-    st.session_state.scanned_pages = []
-    st.session_state.messages = []
+
+if "document_ready" not in st.session_state:
+    st.session_state.document_ready = False
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Header
+# ---------------------------------------------------------
+
+st.markdown(
+    '<div class="main-title">📚 HR Policy Assistant</div>',
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="subtitle">
+    Upload an HR policy PDF and ask questions about its contents.
+    The assistant uses Retrieval-Augmented Generation (RAG) to
+    retrieve relevant policy sections before generating an answer.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------
 # Sidebar
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Settings")
 
     chunk_size = st.slider(
-        "Chunk size (words)",
-        min_value=MIN_CHUNK_SIZE,
-        max_value=MAX_CHUNK_SIZE,
+        "Chunk size",
+        min_value=500,
+        max_value=2000,
         value=DEFAULT_CHUNK_SIZE,
-        step=50,
-        help="Number of words placed into each policy chunk.",
+        step=100,
+        help="Approximate number of characters in each text chunk.",
     )
 
     chunk_overlap = st.slider(
-        "Chunk overlap (words)",
-        min_value=MIN_CHUNK_OVERLAP,
-        max_value=MAX_CHUNK_OVERLAP,
+        "Chunk overlap",
+        min_value=0,
+        max_value=500,
         value=DEFAULT_CHUNK_OVERLAP,
-        step=10,
-        help="Number of words shared between neighboring chunks.",
+        step=50,
+        help="Number of characters shared between neighboring chunks.",
     )
 
     top_k = st.slider(
-        "Top-K retrieved chunks",
-        min_value=MIN_TOP_K,
-        max_value=MAX_TOP_K,
+        "Retrieved chunks (k)",
+        min_value=1,
+        max_value=10,
         value=DEFAULT_TOP_K,
-        step=1,
-        help="Maximum number of policy chunks sent to Gemini.",
-    )
-
-    similarity_threshold = st.slider(
-        "Retrieval similarity threshold",
-        min_value=0.0,
-        max_value=0.9,
-        value=DEFAULT_SIMILARITY_THRESHOLD,
-        step=0.05,
-        help=(
-            "Retrieved chunks below this normalized cosine-similarity "
-            "threshold are discarded."
-        ),
+        help="Number of relevant chunks retrieved from FAISS.",
     )
 
     st.divider()
 
-    st.subheader("Gemini")
-    st.caption(f"Model: `{GEMINI_MODEL_NAME}`")
-    st.caption(f"Embeddings: `{EMBEDDING_MODEL_NAME}`")
+    st.markdown("### 🔄 RAG Pipeline")
+
+    st.markdown(
+        """
+        **1.** Upload PDF  
+        ↓  
+        **2.** Extract text  
+        ↓  
+        **3.** Create chunks  
+        ↓  
+        **4.** Generate embeddings  
+        ↓  
+        **5.** Build FAISS index  
+        ↓  
+        **6.** Retrieve relevant chunks  
+        ↓  
+        **7.** Ask Groq LLM  
+        ↓  
+        **8.** Generate answer
+        """
+    )
 
     st.divider()
 
-    if st.button(
-        "🗑️ Clear chat",
-        use_container_width=True,
-    ):
-        clear_chat()
-        st.rerun()
-
-    if st.button(
-        "🔄 Reset document",
-        use_container_width=True,
-    ):
-        reset_document_state()
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
         st.rerun()
 
 
-# ---------------------------------------------------------------------------
-# Main UI
-# ---------------------------------------------------------------------------
-
-st.title("📘 HR Policy Assistant")
-st.write(
-    "Upload an HR Policy PDF, then ask questions about its contents. "
-    "Answers are grounded only in retrieved text from your uploaded policy."
-)
-
-api_key = os.getenv("GEMINI_API_KEY", "").strip()
-
-if not api_key:
-    st.warning(
-        "GEMINI_API_KEY is not configured. Add it to your environment or "
-        "a local .env file before asking questions."
-    )
+# ---------------------------------------------------------
+# PDF uploader
+# ---------------------------------------------------------
 
 uploaded_file = st.file_uploader(
-    "Upload HR Policy PDF",
+    "📄 Upload your HR Policy PDF",
     type=["pdf"],
-    help="Upload a text-based HR policy PDF. Scanned/image-only PDFs require OCR.",
+    help="Upload a PDF containing your organization's HR policy.",
 )
 
-# ---------------------------------------------------------------------------
-# Process uploaded document
-# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------
+# Process uploaded PDF
+# ---------------------------------------------------------
 
 if uploaded_file is not None:
-    pdf_bytes = uploaded_file.getvalue()
-    current_hash = get_file_hash(pdf_bytes)
 
-    settings_changed = (
-        st.session_state.get("document_info") is not None
-        and (
-            st.session_state.document_info.get("chunk_size") != chunk_size
-            or st.session_state.document_info.get("chunk_overlap") != chunk_overlap
-        )
-    )
+    # Detect a new file.
+    if uploaded_file.name != st.session_state.document_name:
 
-    document_changed = (
-        st.session_state.document_hash != current_hash
-        or st.session_state.chunks is None
-        or st.session_state.index is None
-        or settings_changed
-    )
+        with st.spinner(
+            "Processing PDF... This may take a moment."
+        ):
+            try:
+                pdf_bytes = uploaded_file.getvalue()
 
-    if document_changed:
-        try:
-            chunks, index, scanned_pages = process_document(
-                pdf_bytes,
-                chunk_size,
-                chunk_overlap,
-            )
+                if not pdf_bytes:
+                    st.error("The uploaded PDF is empty.")
+                    st.stop()
 
-            st.session_state.document_hash = current_hash
-            st.session_state.document_name = uploaded_file.name
-            st.session_state.document_info = {
-                "chunk_size": chunk_size,
-                "chunk_overlap": chunk_overlap,
-                "page_count": len(extract_pdf_pages(pdf_bytes)[0]),
-            }
-            st.session_state.chunks = chunks
-            st.session_state.index = index
-            st.session_state.indexed_chunk_count = len(chunks)
-            st.session_state.scanned_pages = scanned_pages
-            st.session_state.messages = []
+                # 1. Extract text
+                pages = extract_text_from_pdf(pdf_bytes)
 
-        except ValueError as exc:
-            reset_document_state()
-            st.error(f"PDF processing error: {exc}")
-        except Exception as exc:
-            reset_document_state()
-            st.error(f"Could not process the PDF: {exc}")
+                if not pages:
+                    st.error(
+                        "No extractable text was found in this PDF. "
+                        "The PDF may be scanned/image-based. "
+                        "Please upload a text-based PDF."
+                    )
+                    st.stop()
 
-# ---------------------------------------------------------------------------
+                # 2. Chunk text
+                chunks = chunk_text(
+                    pages,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                )
+
+                if not chunks:
+                    st.error(
+                        "No usable text chunks could be created "
+                        "from the PDF."
+                    )
+                    st.stop()
+
+                # 3. Load embedding model
+                embedding_model = load_embedding_model()
+
+                # 4. Generate embeddings
+                texts = [chunk["text"] for chunk in chunks]
+
+                embeddings = create_embeddings(
+                    texts,
+                    embedding_model,
+                )
+
+                # 5. Build FAISS index
+                index = build_faiss_index(embeddings)
+
+                # Store everything in session state.
+                st.session_state.document_name = uploaded_file.name
+                st.session_state.pages = pages
+                st.session_state.chunks = chunks
+                st.session_state.index = index
+                st.session_state.document_ready = True
+
+                # Clear old conversation because a new policy
+                # has been uploaded.
+                st.session_state.messages = []
+
+                st.success(
+                    f"✅ {uploaded_file.name} processed successfully."
+                )
+
+            except ValueError as exc:
+                st.error(str(exc))
+                st.stop()
+
+            except Exception:
+                st.error(
+                    "Something went wrong while processing the PDF. "
+                    "Please try another PDF."
+                )
+                st.stop()
+
+
+# ---------------------------------------------------------
 # Document status
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 
-if st.session_state.chunks is not None:
-    page_count = st.session_state.document_info["page_count"]
+if st.session_state.document_ready:
 
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric("PDF pages", page_count)
-
-    with col2:
-        st.metric("Indexed chunks", st.session_state.indexed_chunk_count)
-
-    with col3:
-        st.metric("Top-K", top_k)
-
-    st.success(
-        f"Loaded **{st.session_state.document_name}** "
-        f"with {st.session_state.indexed_chunk_count} searchable chunks."
+    st.markdown(
+        f"""
+        <div class="success-box">
+        <strong>📄 Current policy:</strong>
+        {st.session_state.document_name}<br>
+        <strong>📑 Pages with text:</strong>
+        {len(st.session_state.pages)}<br>
+        <strong>🧩 Chunks:</strong>
+        {len(st.session_state.chunks)}
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    if st.session_state.scanned_pages:
-        scanned_display = ", ".join(
-            str(page) for page in st.session_state.scanned_pages
-        )
+    st.write("")
 
-        st.info(
-            "Some pages contained no extractable text and were skipped for "
-            f"retrieval: pages {scanned_display}. This can indicate scanned "
-            "or image-only pages."
-        )
 
 else:
+
     st.info(
-        "Upload an HR policy PDF to build the searchable policy index."
+        "👆 Upload an HR Policy PDF to start asking questions."
     )
 
 
-# ---------------------------------------------------------------------------
-# Conversation history
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+# Display previous chat messages
+# ---------------------------------------------------------
 
 for message in st.session_state.messages:
-    role = message["role"]
 
-    with st.chat_message(role):
+    with st.chat_message(message["role"]):
+
         st.markdown(message["content"])
 
-        if role == "assistant":
-            display_sources(message.get("sources", []))
+        # Show sources for assistant messages.
+        if (
+            message["role"] == "assistant"
+            and message.get("sources")
+        ):
+            display_sources(message["sources"])
 
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 # Chat input
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 
-prompt = st.chat_input(
-    "Ask a question about the uploaded HR policy..."
+question = st.chat_input(
+    "Ask a question about the HR policy..."
 )
 
-if prompt:
-    question = prompt.strip()
 
-    if not question:
-        st.warning("Please enter a question.")
+# ---------------------------------------------------------
+# Handle user question
+# ---------------------------------------------------------
+
+if question:
+
+    if not st.session_state.document_ready:
+
+        st.warning(
+            "Please upload an HR Policy PDF before asking a question."
+        )
         st.stop()
 
+    # Display user message.
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    # Save user message.
     st.session_state.messages.append(
         {
             "role": "user",
@@ -757,58 +801,54 @@ if prompt:
         }
     )
 
-    with st.chat_message("user"):
-        st.markdown(question)
+    try:
 
-    with st.chat_message("assistant"):
-        if not st.session_state.chunks or st.session_state.index is None:
-            answer = "Please upload a valid HR policy PDF before asking questions."
-            sources = []
-            st.warning(answer)
+        embedding_model = load_embedding_model()
 
-        elif not api_key:
-            answer = "GEMINI_API_KEY is not configured."
-            sources = []
-            st.error(answer)
+        # Retrieve relevant chunks.
+        retrieved_chunks = retrieve_relevant_chunks(
+            question=question,
+            model=embedding_model,
+            index=st.session_state.index,
+            chunks=st.session_state.chunks,
+            top_k=top_k,
+        )
 
-        else:
-            with st.spinner("Searching the HR policy..."):
-                model = get_embedding_model()
+        # Generate answer.
+        with st.chat_message("assistant"):
 
-                try:
-                    sources = retrieve_relevant_chunks(
-                        question=question,
-                        index=st.session_state.index,
-                        chunks=st.session_state.chunks,
-                        model=model,
-                        top_k=top_k,
-                        similarity_threshold=similarity_threshold,
-                    )
-                except Exception as exc:
-                    sources = []
-                    st.error(f"Retrieval failed: {exc}")
+            with st.spinner("Searching the policy..."):
 
-            if sources:
-                with st.spinner("Generating a policy-grounded answer..."):
-                    try:
-                        answer = generate_grounded_answer(
-                            question=question,
-                            retrieved_chunks=sources,
-                            api_key=api_key,
-                        )
-                    except RuntimeError as exc:
-                        answer = "The Gemini API request could not be completed."
-                        st.error(str(exc))
-            else:
-                answer = FALLBACK_ANSWER
+                answer = generate_answer(
+                    question,
+                    retrieved_chunks,
+                )
 
             st.markdown(answer)
-            display_sources(sources)
 
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "sources": sources,
-        }
-    )
+            # Display source chunks.
+            display_sources(retrieved_chunks)
+
+        # Save assistant response.
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": retrieved_chunks,
+            }
+        )
+
+    except ValueError as exc:
+
+        st.error(str(exc))
+
+    except RuntimeError as exc:
+
+        st.error(str(exc))
+
+    except Exception:
+
+        st.error(
+            "An unexpected error occurred while answering "
+            "your question. Please try again."
+        )
